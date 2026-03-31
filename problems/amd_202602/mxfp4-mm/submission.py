@@ -2,14 +2,13 @@
 """
 MXFP4 GEMM for AMD MI355X.
 
-Uses aiter's optimized gemm_a4w4 kernel with per-1x32 MXFP4 quantization.
+Optimization: Use gemm_afp4wfp4 which fuses activation quantization
+with GEMM to reduce HBM traffic and kernel launch overhead.
 """
 import torch
 from task import input_t, output_t
 from aiter import dtypes
 import aiter
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
-from aiter.utility.fp4_utils import e8m0_shuffle
 
 
 def custom_kernel(data: input_t) -> output_t:
@@ -32,6 +31,18 @@ def custom_kernel(data: input_t) -> output_t:
     B = B.contiguous()
     m, k = A.shape
     n, _ = B.shape
+
+    # Try fused kernel: bf16 A + fp4x2 B -> bf16 C with fused quant
+    # This avoids writing intermediate quantized activation to HBM
+    try:
+        from aiter.ops.triton.gemm.basic import gemm_afp4wfp4
+        return gemm_afp4wfp4(A, B_shuffle, B_scale_sh, out_dtype=dtypes.bf16)
+    except Exception:
+        pass
+
+    # Fallback: two-step quant + gemm
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    from aiter.utility.fp4_utils import e8m0_shuffle
 
     # Quantize activation with shuffle
     A_fp4, A_scale = dynamic_mxfp4_quant(A)
