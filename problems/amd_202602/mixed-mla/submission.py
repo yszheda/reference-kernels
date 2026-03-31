@@ -273,7 +273,7 @@ def mla_decode_kernel(
                     v_val = dequantize_mxfp4_element(
                         kv_ptr, kv_scale_ptr,
                         kv_idx * num_kv_heads + kv_head_idx,
-                        i,  # V dimension offset within block
+                        d_out + i,  # V dimension offset within block
                         v_head_dim
                     )
                     acc_val += scores[row] * v_val
