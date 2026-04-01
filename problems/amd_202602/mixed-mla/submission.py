@@ -1,353 +1,296 @@
 """
-MLA (Multi-head Latent Attention) decode kernel — FlyDSL Implementation
+MLA (Multi-head Latent Attention) decode kernel — Pure FlyDSL Implementation
 
-DeepSeek-R1 forward_absorb MLA on AMD MI355X (CDNA4 architecture).
-
-Key optimizations:
-1. Pure FlyDSL kernel with Flash Attention-style block loop
-2. Per-thread MXFP4 dequantization in registers (minimal LDS pressure)
-3. MQA pattern: Load KV once, broadcast across 16 query heads
-4. Online softmax with running max/sum for numerical stability
-
-Configuration:
-  num_heads = 16, num_kv_heads = 1
-  qk_head_dim = 576, v_head_dim = 512
-  sm_scale = 1.0 / sqrt(576)
+DeepSeek-R1 forward_absorb MLA on AMD MI355X.
+Q: [total_q, num_heads, qk_head_dim=576]
+KV: [total_kv, num_kv_heads=1, qk_head_dim=576]
+Out: [total_q, num_heads, v_head_dim=512]
 """
 
 import torch
 from task import input_t, output_t
 
-# ============================================================================
-# FlyDSL Imports (with graceful fallback for local testing)
-# ============================================================================
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 
-try:
-    from flydsl import (
-        kernel, function, Pointer, Array,
-        program_id, load, store, atomic_add,
-        zeros, max, min, exp, sum, range,
-        barrier, mem_fence, exp2,
-    )
-    from flydsl.types import fp4x2, fp8_e8m0, bfloat16, float32, int32
-    FLYDSL_AVAILABLE = True
-except ImportError:
-    FLYDSL_AVAILABLE = False
-    def kernel(fn): return fn
-    def function(fn): return fn
-
-    # Make Pointer and Array subscriptable for type hints
-    from typing import Generic, TypeVar
-    T = TypeVar('T')
-    class Pointer(Generic[T]): pass
-    class Array(Generic[T]): pass
-
-    # Type placeholders
-    fp4x2 = fp8_e8m0 = bfloat16 = float32 = int32 = type
-
-# ============================================================================
-# DeepSeek-R1 MLA Constants
-# ============================================================================
-
+# DeepSeek-R1 Constants
 NUM_HEADS = 16
 NUM_KV_HEADS = 1
-KV_LORA_RANK = 512
-QK_ROPE_HEAD_DIM = 64
-QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
-V_HEAD_DIM = KV_LORA_RANK                       # 512
-SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
+QK_HEAD_DIM = 576  # 512 + 64
+V_HEAD_DIM = 512
+SM_SCALE = 1.0 / (576 ** 0.5)
 
-# Block sizes (tunable parameters)
-BLOCK_KV = 64       # KV sequence tile size
-BLOCK_DK = 64       # QK dimension tile for MFMA
-BLOCK_DV = 64       # V dimension tile for MFMA
-
-# ============================================================================
-# FlyDSL Helper Functions: MXFP4 Dequantization
-# ============================================================================
-
-@function
-def unpack_fp4_low(byte_val: int32) -> float32:
-    """
-    Extract low 4 bits and convert FP4 (E2M1) to float32.
-    FP4 E2M1 format: 1 sign, 2 exp, 1 mantissa.
-    """
-    val = byte_val & 0x0F
-    sign = (val >> 3) & 0x1
-    exp_bits = (val >> 1) & 0x3
-    mantissa = val & 0x1
-
-    # Decode FP4 to float32
-    if exp_bits == 0:
-        return float32(0.0) if sign == 0 else float32(-0.0)
-    elif exp_bits == 1:
-        # Normalized: (-1)^s * 2^(1-1) * (1 + m/2)
-        base = float32(1.0) + float32(mantissa) * float32(0.5)
-        return base if sign == 0 else -base
-    elif exp_bits == 2:
-        # Normalized: (-1)^s * 2^(2-1) * (1 + m/2)
-        base = float32(2.0) * (float32(1.0) + float32(mantissa) * float32(0.5))
-        return base if sign == 0 else -base
-    else:  # exp_bits == 3
-        # Special case (inf/nan in standard FP4)
-        return float32('inf') if sign == 0 else float32('-inf')
+# Tile sizes
+BLOCK_Q = 1  # Decode mode: q_seq_len = 1 per batch
+BLOCK_KV = 64  # KV sequence tile
+BLOCK_D = 32  # Dimension tile for QK
+BLOCK_DV = 64  # V dimension tile
 
 
-@function
-def unpack_fp4_high(byte_val: int32) -> float32:
-    """Extract high 4 bits and convert FP4 (E2M1) to float32."""
-    val = (byte_val >> 4) & 0x0F
-    return unpack_fp4_low(val)
-
-
-@function
-def e8m0_to_float32(fp8_val: int32) -> float32:
-    """
-    Convert FP8 E8M0 to float32.
-    E8M0: 1 sign bit, 7 exponent bits, 0 mantissa bits.
-    Bias = 64 for E8M0.
-    """
-    sign = (fp8_val >> 7) & 0x1
-    exp_bits = fp8_val & 0x7F
-
-    # E8M0 represents powers of 2 with bias 64
-    unbiased_exp = float32(exp_bits) - float32(64)
-    result = exp2(unbiased_exp)
-    return result if sign == 0 else -result
-
-
-@function
-def dequantize_mxfp4_element(
-    fp4_ptr: Pointer[fp4x2],
-    scale_ptr: Pointer[fp8_e8m0],
-    row_idx: int32,
-    col_idx: int32,
-    row_stride: int32,
-) -> float32:
-    """
-    Dequantize a single MXFP4 element.
-
-    MXFP4 format: 2 FP4 values per byte, 32-element blocks share one E8M0 scale.
-    """
-    # Compute fp4 byte index (2 elements per byte)
-    fp4_idx = row_idx * (row_stride // 2) + col_idx // 2
-    fp4_byte = load(fp4_ptr + fp4_idx)
-
-    # Get the right FP4 value (low or high nibble)
-    val = unpack_fp4_low(fp4_byte) if (col_idx % 2 == 0) else unpack_fp4_high(fp4_byte)
-
-    # Get scale for this 32-element block
-    scale_block_idx = col_idx // 32
-    scale_idx = row_idx * ((row_stride + 31) // 32) + scale_block_idx
-    scale_fp8 = load(scale_ptr + scale_idx)
-    scale_f32 = e8m0_to_float32(scale_fp8)
-
-    return val * scale_f32
-
-# ============================================================================
-# FlyDSL Kernel: MLA Decode with MXFP4 Dequant
-# ============================================================================
-
-@kernel
+@flyc.kernel(known_block_size=[256, 1, 1])
 def mla_decode_kernel(
-    # Output
-    out_ptr: Pointer[bfloat16],
-
-    # Inputs
-    q_ptr: Pointer[bfloat16],
-    kv_ptr: Pointer[fp4x2],
-    kv_scale_ptr: Pointer[fp8_e8m0],
-
-    # Indirect pointers
-    qo_indptr: Pointer[int32],
-    kv_indptr: Pointer[int32],
-
-    # Dimensions
-    num_heads: int32,
-    num_kv_heads: int32,
-    qk_head_dim: int32,
-    v_head_dim: int32,
-    sm_scale: float32,
-
-    # Block sizes (compile-time constants)
-    BLOCK_KV: int32,
-    BLOCK_DK: int32,
-    BLOCK_DV: int32,
+    q: fx.Tensor,  # [total_q, NUM_HEADS, QK_HEAD_DIM] bf16
+    kv: fx.Tensor,  # [total_kv, NUM_KV_HEADS, QK_HEAD_DIM] bf16
+    out: fx.Tensor,  # [total_q, NUM_HEADS, V_HEAD_DIM] bf16
+    qo_indptr: fx.Tensor,  # [batch_size + 1] int32
+    kv_indptr: fx.Tensor,  # [batch_size + 1] int32
+    batch_size: fx.Constexpr[int],
+    max_q_len: fx.Constexpr[int],
 ):
     """
-    MLA Decode Kernel - Flash Attention style with block loop.
-    Grid: (batch_size, num_heads, q_seq_len)
-    Each work item processes one (batch, head, q_token) tuple.
+    MLA Decode Kernel using FlyDSL.
+    Grid: (batch_size, NUM_HEADS, max_q_len)
+    Block: 256 threads
     """
-    # Compute (batch_idx, head_idx, q_token_idx) from grid
-    batch_idx = program_id(0)
-    head_idx = program_id(1)
-    q_token_idx = program_id(2)
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x  # batch index
+    hid = fx.block_idx.y  # head index
+    qid = fx.block_idx.z  # query token index
 
-    # Load sequence pointers
-    q_start = load(qo_indptr + batch_idx)
-    q_end = load(qo_indptr + batch_idx + 1)
-    q_seq_len = q_end - q_start
+    # Create buffer resources for global memory access
+    q_rsrc = fx.rocdl.make_buffer_tensor(q)
+    kv_rsrc = fx.rocdl.make_buffer_tensor(kv)
+    out_rsrc = fx.rocdl.make_buffer_tensor(out)
+    qo_rsrc = fx.rocdl.make_buffer_tensor(qo_indptr)
+    kv_rsrc_indptr = fx.rocdl.make_buffer_tensor(kv_indptr)
 
-    # Early exit for invalid work items
-    if q_token_idx >= q_seq_len:
+    # Load sequence boundaries for this batch
+    q_start = fx.rocdl.buffer_load(qo_rsrc, bid, idx_size=1, value_type=fx.T.i32)
+    q_end = fx.rocdl.buffer_load(qo_rsrc, bid + 1, idx_size=1, value_type=fx.T.i32)
+    q_len = fx.arith.subi(q_end, q_start)
+
+    kv_start = fx.rocdl.buffer_load(kv_rsrc_indptr, bid, idx_size=1, value_type=fx.T.i32)
+    kv_end = fx.rocdl.buffer_load(kv_rsrc_indptr, bid + 1, idx_size=1, value_type=fx.T.i32)
+    kv_len = fx.arith.subi(kv_end, kv_start)
+
+    # Early exit if this query token doesn't exist
+    if qid >= q_len:
         return
 
-    # Compute Q offset for this work item
-    q_offset = q_start + q_token_idx
+    # Allocate shared memory for Q tile and KV scores
+    # Q: [QK_HEAD_DIM] bf16 - 576 * 2 bytes = 1152 bytes
+    # Scores: [BLOCK_KV] f32 - 64 * 4 bytes = 256 bytes
+    smem_size = 2048  # Total shared memory
 
-    # Load Q vector: [qk_head_dim] bf16 -> float32
-    q_vec = zeros([qk_head_dim], dtype=float32)
-    base_offset = q_offset * num_heads * qk_head_dim + head_idx * qk_head_dim
+    # Compute Q offset: (q_start + qid) * NUM_HEADS * QK_HEAD_DIM + hid * QK_HEAD_DIM
+    q_global_idx = fx.arith.addi(q_start, qid)
+    q_stride_head = fx.Int32(NUM_HEADS * QK_HEAD_DIM)
+    q_offset = fx.arith.addi(
+        fx.arith.muli(q_global_idx, q_stride_head),
+        fx.arith.muli(hid, fx.Int32(QK_HEAD_DIM))
+    )
 
-    for d in range(0, qk_head_dim, BLOCK_DK):
-        tile_size = min(BLOCK_DK, qk_head_dim - d)
-        q_tile = load(q_ptr + base_offset + d, mask=range(tile_size), other=float32(0.0))
-        for i in range(tile_size):
-            q_vec[d + i] = q_tile[i].to(float32)
+    # Load Q vector [QK_HEAD_DIM] into registers
+    # Each thread loads QK_HEAD_DIM / 256 elements
+    q_frag = fx.make_fragment((fx.Int32(QK_HEAD_DIM),), fx.T.bf16)
 
-    # Initialize online softmax accumulators
-    m_i = float32(-1e30)  # Running max (large negative initial)
-    d_i = float32(0.0)     # Running sum
-    acc = zeros([v_head_dim], dtype=float32)  # Output accumulator
+    for d_base in range(fx.Int32(0), fx.Int32(QK_HEAD_DIM), fx.Int32(256)):
+        d_idx = fx.arith.addi(d_base, tid)
+        if d_idx < fx.Int32(QK_HEAD_DIM):
+            q_val = fx.rocdl.buffer_load(
+                q_rsrc,
+                fx.arith.addi(q_offset, d_idx),
+                idx_size=1,
+                value_type=fx.T.bf16
+            )
+            fx.vector.store(q_val, q_frag, [d_idx])
 
-    # KV sequence range for this batch
-    kv_start = load(kv_indptr + batch_idx)
-    kv_end = load(kv_indptr + batch_idx + 1)
+    # Synchronize after loading Q
+    fx.gpu.barrier()
 
-    # KV head index (MQA: same KV head for all query heads)
-    kv_head_idx = head_idx % num_kv_heads
+    # Online softmax accumulators
+    m_i = fx.Float32(-1e30)  # Running max
+    d_i = fx.Float32(0.0)  # Running sum
 
-    # Block loop over KV sequence
-    for kv_block_start in range(kv_start, kv_end, BLOCK_KV):
-        kv_block_len = min(kv_end - kv_block_start, BLOCK_KV)
+    # Output accumulator [V_HEAD_DIM]
+    acc = fx.make_fragment((fx.Int32(V_HEAD_DIM),), fx.T.f32)
+    for i in range(fx.Int32(V_HEAD_DIM)):
+        fx.vector.store(fx.Float32(0.0), acc, [i])
 
-        # Compute scores: Q @ K^T for this block
-        scores = zeros([kv_block_len], dtype=float32)
+    # Loop over KV tiles
+    num_kv_tiles = fx.arith.divui(
+        fx.arith.addi(kv_len, fx.Int32(BLOCK_KV - 1)),
+        fx.Int32(BLOCK_KV)
+    )
 
-        for row in range(kv_block_len):
-            kv_idx = kv_block_start + row
-            score = float32(0.0)
+    for kv_tile in range(num_kv_tiles):
+        kv_tile_start = fx.arith.muli(kv_tile, fx.Int32(BLOCK_KV))
+        kv_tile_end = fx.min(kv_tile_start + fx.Int32(BLOCK_KV), kv_len)
+        kv_tile_len = fx.arith.subi(kv_tile_end, kv_tile_start)
 
-            # Dot product: Q · K
-            for d in range(0, qk_head_dim, BLOCK_DK):
-                tile_size = min(BLOCK_DK, qk_head_dim - d)
-                for i in range(tile_size):
-                    # Dequantize K element on-the-fly
-                    k_val = dequantize_mxfp4_element(
-                        kv_ptr, kv_scale_ptr,
-                        kv_idx * num_kv_heads + kv_head_idx,
-                        d + i,
-                        qk_head_dim
+        # Compute Q @ K^T for this KV tile
+        # scores[kv_local] = sum_d Q[d] * K[kv_idx, d]
+        scores = fx.make_fragment((fx.Int32(BLOCK_KV),), fx.T.f32)
+
+        # Each thread computes scores for a subset of KV positions
+        for kv_local in range(kv_tile_len):
+            kv_idx = fx.arith.addi(kv_start, fx.arith.addi(kv_tile_start, kv_local))
+
+            # KV offset: kv_idx * NUM_KV_HEADS * QK_HEAD_DIM
+            kv_offset = fx.arith.muli(kv_idx, fx.Int32(NUM_KV_HEADS * QK_HEAD_DIM))
+
+            # Dot product Q · K - parallel reduction across threads
+            # Each thread computes partial dot product
+            dot_acc = fx.Float32(0.0)
+
+            # Unroll loop for QK_HEAD_DIM
+            for d in range(fx.Int32(0), fx.Int32(QK_HEAD_DIM), fx.Int32(4)):
+                d0 = fx.arith.addi(d, tid)
+
+                # Load 4 consecutive elements from Q
+                if d0 < fx.Int32(QK_HEAD_DIM):
+                    q_val = fx.vector.load(fx.T.bf16, q_frag, [d0])
+                    # Convert bf16 to f32
+                    q_f32 = fx.arith.bitcast(q_val, fx.T.f32)
+
+                    # Load K from global memory
+                    k_val = fx.rocdl.buffer_load(
+                        kv_rsrc,
+                        fx.arith.addi(kv_offset, d0),
+                        idx_size=1,
+                        value_type=fx.T.bf16
                     )
-                    score += q_vec[d + i] * k_val
+                    k_f32 = fx.arith.bitcast(k_val, fx.T.f32)
 
-            scores[row] = score * sm_scale
+                    # Accumulate
+                    dot_acc = fx.arith.addf(dot_acc, fx.arith.mulf(q_f32, k_f32))
 
-        # Online softmax: update running max/sum
-        m_block = float32(-1e30)
-        for row in range(kv_block_len):
-            m_block = max(m_block, scores[row])
+            # Store partial score (will need reduction across warp/block)
+            # For simplicity, thread 0 handles the final reduction
+            if tid == fx.Int32(0):
+                # Apply scale
+                score_scaled = fx.arith.mulf(dot_acc, fx.Float32(SM_SCALE))
+                fx.vector.store(score_scaled, scores, [kv_local])
 
-        m_new = max(m_i, m_block)
+        fx.gpu.barrier()
 
-        # Compute exp(sum) for normalization
-        exp_sum = float32(0.0)
-        for row in range(kv_block_len):
-            exp_sum += exp(scores[row] - m_new)
+        # Online softmax update (only thread 0 for simplicity)
+        if tid == fx.Int32(0):
+            # Find max in this tile
+            m_tile = fx.Float32(-1e30)
+            for i in range(kv_tile_len):
+                s = fx.vector.load(fx.T.f32, scores, [i])
+                m_tile = fx.max(m_tile, s)
 
-        d_i = d_i * exp(m_i - m_new) + exp_sum
-        m_i = m_new
+            # Update running max
+            m_new = fx.max(m_i, m_tile)
 
-        # Accumulate: acc = acc * alpha + scores @ V
-        alpha = exp(m_i - m_new)
-        for d_out in range(0, v_head_dim, BLOCK_DV):
-            tile_size = min(BLOCK_DV, v_head_dim - d_out)
+            # Rescale previous accumulator
+            if m_i > fx.Float32(-1e29):  # Not first iteration
+                scale_prev = fx.math.exp2(fx.arith.mulf(fx.arith.subf(m_i, m_new), fx.Float32(1.442695)))
+                d_i = fx.arith.mulf(d_i, scale_prev)
+                # Rescale output accumulator
+                for d_out in range(fx.Int32(V_HEAD_DIM)):
+                    acc_val = fx.vector.load(fx.T.f32, acc, [d_out])
+                    acc_val = fx.arith.mulf(acc_val, scale_prev)
+                    fx.vector.store(acc_val, acc, [d_out])
 
-            for i in range(tile_size):
-                acc_val = acc[d_out + i] * alpha
+            # Compute exp and sum for this tile
+            exp_sum = fx.Float32(0.0)
+            for i in range(kv_tile_len):
+                s = fx.vector.load(fx.T.f32, scores, [i])
+                exp_val = fx.math.exp2(fx.arith.mulf(fx.arith.subf(s, m_new), fx.Float32(1.442695)))
+                fx.vector.store(exp_val, scores, [i])
+                exp_sum = fx.arith.addf(exp_sum, exp_val)
 
-                for row in range(kv_block_len):
-                    kv_idx = kv_block_start + row
-                    # Dequantize V element on-the-fly
-                    v_val = dequantize_mxfp4_element(
-                        kv_ptr, kv_scale_ptr,
-                        kv_idx * num_kv_heads + kv_head_idx,
-                        d_out + i,  # V dimension offset within block
-                        v_head_dim
+            d_i = fx.arith.addf(d_i, exp_sum)
+            m_i = m_new
+
+            # Accumulate: acc += scores @ V
+            for kv_local in range(kv_tile_len):
+                kv_idx = fx.arith.addi(kv_start, fx.arith.addi(kv_tile_start, kv_local))
+                # V offset: kv_idx * NUM_KV_HEADS * QK_HEAD_DIM (first V_HEAD_DIM dims)
+                kv_base = fx.arith.muli(kv_idx, fx.Int32(NUM_KV_HEADS * QK_HEAD_DIM))
+
+                prob = fx.vector.load(fx.T.f32, scores, [kv_local])
+
+                for d_out in range(fx.Int32(V_HEAD_DIM)):
+                    v_val = fx.rocdl.buffer_load(
+                        kv_rsrc,
+                        fx.arith.addi(kv_base, d_out),
+                        idx_size=1,
+                        value_type=fx.T.bf16
                     )
-                    acc_val += scores[row] * v_val
+                    v_f32 = fx.arith.bitcast(v_val, fx.T.f32)
 
-                acc[d_out + i] = acc_val
+                    acc_val = fx.vector.load(fx.T.f32, acc, [d_out])
+                    acc_val = fx.arith.addf(acc_val, fx.arith.mulf(prob, v_f32))
+                    fx.vector.store(acc_val, acc, [d_out])
 
-    # Normalize and store output
-    for d in range(0, v_head_dim, BLOCK_DV):
-        tile_size = min(BLOCK_DV, v_head_dim - d)
-        out_tile = zeros([tile_size], dtype=bfloat16)
+        fx.gpu.barrier()
 
-        for i in range(tile_size):
-            out_tile[i] = (acc[d + i] / d_i).to(bfloat16)
+    # Write output (normalize and store)
+    out_offset = fx.arith.addi(
+        fx.arith.muli(q_global_idx, fx.Int32(NUM_HEADS * V_HEAD_DIM)),
+        fx.arith.muli(hid, fx.Int32(V_HEAD_DIM))
+    )
 
-        offset = q_offset * num_heads * v_head_dim + head_idx * v_head_dim + d
-        store(out_ptr + offset, out_tile, mask=range(tile_size))
+    # Each thread writes V_HEAD_DIM / 256 elements
+    for d_base in range(fx.Int32(0), fx.Int32(V_HEAD_DIM), fx.Int32(256)):
+        d_idx = fx.arith.addi(d_base, tid)
+        if d_idx < fx.Int32(V_HEAD_DIM):
+            acc_val = fx.vector.load(fx.T.f32, acc, [d_idx])
+            # Normalize
+            out_val = fx.arith.divf(acc_val, d_i)
+            # Convert to bf16
+            out_bf16 = fx.arith.bitcast(out_val, fx.T.bf16)
+            fx.rocdl.buffer_store(
+                out_bf16,
+                out_rsrc,
+                fx.arith.addi(out_offset, d_idx),
+                idx_size=1
+            )
 
 
-# ============================================================================
-# Python Wrapper: Custom Kernel Entry Point
-# ============================================================================
+@flyc.jit
+def launch_mla_decode(
+    q: fx.Tensor,
+    kv: fx.Tensor,
+    out: fx.Tensor,
+    qo_indptr: fx.Tensor,
+    kv_indptr: fx.Tensor,
+    batch_size: int,
+    max_q_len: int,
+    stream: fx.Stream = fx.Stream(None),
+):
+    """Launch MLA decode kernel."""
+    grid = (batch_size, NUM_HEADS, max_q_len)
+    mla_decode_kernel(
+        q, kv, out, qo_indptr, kv_indptr,
+        batch_size, max_q_len
+    ).launch(
+        grid=grid,
+        block=(256, 1, 1),
+        smem=2048,
+        stream=stream
+    )
+
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    FlyDSL MLA decode kernel wrapper.
-
-    Args:
-        data: (q, kv_data, qo_indptr, kv_indptr, config)
-
-    Returns:
-        output: (total_q, num_heads, v_head_dim) bf16
+    MLA decode kernel wrapper using pure FlyDSL.
     """
     q, kv_data, qo_indptr, kv_indptr, config = data
 
     batch_size = config['batch_size']
     num_heads = config['num_heads']
-    num_kv_heads = config['num_kv_heads']
-    qk_head_dim = config['qk_head_dim']
     v_head_dim = config['v_head_dim']
     q_seq_len = config['q_seq_len']
 
     total_q = q.shape[0]
+    device = q.device
 
-    # Get MXFP4 KV buffer and scales
-    kv_buffer_mxfp4, kv_scale_mxfp4 = kv_data['mxfp4']
+    # Get bf16 KV buffer
+    kv_buffer = kv_data['bf16']
 
     # Allocate output
-    output = torch.zeros((total_q, num_heads, v_head_dim),
-                         dtype=torch.bfloat16, device=q.device)
+    output = torch.zeros((total_q, num_heads, v_head_dim), dtype=torch.bfloat16, device=device)
 
-    if FLYDSL_AVAILABLE:
-        # Launch FlyDSL kernel
-        # Grid: (batch_size, num_heads, q_seq_len)
-        grid = (batch_size, num_heads, q_seq_len)
-
-        mla_decode_kernel[grid](
-            out_ptr=output,
-            q_ptr=q,
-            kv_ptr=kv_buffer_mxfp4,
-            kv_scale_ptr=kv_scale_mxfp4,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            qk_head_dim=qk_head_dim,
-            v_head_dim=v_head_dim,
-            sm_scale=SM_SCALE,
-            BLOCK_KV=BLOCK_KV,
-            BLOCK_DK=BLOCK_DK,
-            BLOCK_DV=BLOCK_DV,
-        )
-    else:
-        # Fallback: use reference implementation
-        from reference import ref_kernel
-        output = ref_kernel(data)
+    # Launch FlyDSL kernel
+    launch_mla_decode(
+        q, kv_buffer, output,
+        qo_indptr, kv_indptr,
+        batch_size, q_seq_len
+    )
 
     return output
